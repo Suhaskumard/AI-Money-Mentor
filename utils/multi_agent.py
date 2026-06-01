@@ -16,7 +16,6 @@ from .money_score import calculate_money_score
 # ✅ CORRECT WAY
 client = Groq(api_key=os.getenv("GROQ_API_KEY", "YOUR_API_KEY"))
 
-
 # ---------------- 🔍 ROUTER ----------------
 def route_query(query):
     query = query.lower()
@@ -38,7 +37,7 @@ def route_query(query):
 
 
 # ---------------- 🤖 AI AGENT ----------------
-def ai_agent(query):
+def ai_agent(client, query): # add the Groq client here since we mentioned it in app.py
     try:
         res = client.chat.completions.create(
             model="llama-3.1-8b-instant",
@@ -140,7 +139,7 @@ def score_agent(query):
 
 
 # ---------------- 🧠 MAIN ----------------
-def run_multi_agent(query):
+def run_multi_agent(client, query):
     task = route_query(query)
 
     print("ROUTED TO:", task)   # ✅ DEBUG
@@ -158,4 +157,4 @@ def run_multi_agent(query):
         return score_agent(query)
 
     else:
-        return ai_agent(query)
+        return ai_agent(client, query)
