@@ -2005,10 +2005,24 @@ style="width:220px;"
   <!-- Loading charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
+                    <!-- Scroll to Top Button -->
+                    <button id="scrollTopBtn" onclick="document.querySelector('.main').scrollTo({top: 0, behavior: 'smooth'})" style="display:none; position:fixed; bottom:30px; right:30px; z-index:100; border-radius:50%; width:44px; height:44px; font-size:20px; align-items:center; justify-content:center;" class="btn btn-gold">↑</button>
+
                     </div><!-- /main -->
 
                     <!-- Loading charts -->
                     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+                    <script>
+                    // Scroll to Top visibility toggle
+                    document.querySelector('.main').addEventListener('scroll', function() {
+                      const btn = document.getElementById('scrollTopBtn');
+                      if (this.scrollTop > 300) {
+                        btn.style.display = 'flex';
+                      } else {
+                        btn.style.display = 'none';
+                      }
+                    });
 
 /* ══════════════════════════════════════════════
    GLOBAL CHART INSTANCES & HELPERS
