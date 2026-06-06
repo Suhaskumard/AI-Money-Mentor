@@ -4,8 +4,6 @@ Thank you for your interest in contributing! This guide walks you through everyt
 
 ---
 
-<!-- test content, delete later -->
-
 ## 📋 Table of Contents
 
 1. [Code of Conduct](#code-of-conduct)
