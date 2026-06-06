@@ -33,7 +33,7 @@ from utils.expense_track import calculate_expense, insights
 app = Flask(__name__)
 
 # ---------------- INIT DATABASE ----------------
-from models import db, Expense, Asset, Liability, BudgetLimit, BudgetAlert
+from models import db, Expense, Asset, Liability, BudgetLimit, BudgetAlert, PriceAlert
 
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///money_mentor.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -213,6 +213,47 @@ def portfolio():
 
     except Exception as e:
         return jsonify({"error": str(e)})
+
+@app.route("/api/alerts", methods=["GET"])
+def get_alerts():
+    try:
+        alerts = PriceAlert.query.all()
+        return jsonify([a.to_dict() for a in alerts])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/alerts", methods=["POST"])
+def create_alert():
+    try:
+        data = request.json
+        if not data or "symbol" not in data or "target_price" not in data:
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        symbol = data["symbol"].strip().upper()
+        target_price = float(data["target_price"])
+        condition = data.get("condition", "above").strip().lower()
+        
+        if condition not in ("above", "below"):
+            return jsonify({"error": "Invalid condition value"}), 400
+            
+        alert = PriceAlert(symbol=symbol, target_price=target_price, condition=condition)
+        db.session.add(alert)
+        db.session.commit()
+        return jsonify(alert.to_dict()), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/alerts/<int:alert_id>", methods=["DELETE"])
+def delete_alert(alert_id):
+    try:
+        alert = PriceAlert.query.get(alert_id)
+        if not alert:
+            return jsonify({"error": "Alert not found"}), 404
+        db.session.delete(alert)
+        db.session.commit()
+        return jsonify({"status": "success", "message": "Alert deleted successfully"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
     
 # ---------------- 💸 TAX ----------------
 @app.route("/tax", methods=["GET", "POST"])
@@ -567,9 +608,33 @@ def check_all_budgets_job():
         for limit in limits:
             run_threshold_checks(limit.category, ym)
 
+def check_stock_alerts_job():
+    with app.app_context():
+        alerts = PriceAlert.query.filter_by(is_triggered=False).all()
+        for alert in alerts:
+            res = get_stock_price(alert.symbol)
+            if res and "price" in res and "error" not in res:
+                current_price = res["price"]
+                triggered = False
+                if alert.condition == "above" and current_price >= alert.target_price:
+                    triggered = True
+                elif alert.condition == "below" and current_price <= alert.target_price:
+                    triggered = True
+                
+                if triggered:
+                    alert.is_triggered = True
+                    print(
+                        f"\n[STOCK ALERT] Triggered for {alert.symbol}\n"
+                        f"Condition: {alert.condition} {alert.target_price}\n"
+                        f"Current Price: {current_price}\n",
+                        file=sys.stderr
+                    )
+        db.session.commit()
+
 if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_all_budgets_job, 'interval', days=1)
+    scheduler.add_job(check_stock_alerts_job, 'interval', minutes=10)
     scheduler.start()
 
 
