@@ -485,7 +485,6 @@ def delete_item():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-
 # Helper to check budget thresholds
 def run_threshold_checks(category, year_month=None):
     if not year_month:
@@ -636,7 +635,6 @@ if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     scheduler.add_job(check_all_budgets_job, 'interval', days=1)
     scheduler.add_job(check_stock_alerts_job, 'interval', minutes=10)
     scheduler.start()
-
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
