@@ -4,27 +4,23 @@ import os
 import sys
 from groq import Groq
 from dotenv import load_dotenv
-from datetime import datetime
-import json
-import hashlib
-
 
 # Load environment variables from .env file (if present)
 load_dotenv()
 
-# ── Startup validation ───────────────────────────────────────
-# Fail fast and clearly if the required API key is missing.
-# Copy .env.example → .env and set your GROQ_API_KEY.
+# Log a warning to console if API key is missing, enabling offline mode.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY or GROQ_API_KEY.strip() in ("", "your_groq_api_key_here"):
     print(
-        "\n[ERROR] GROQ_API_KEY is not configured.\n"
+        "\n[WARNING] GROQ_API_KEY is not configured. AI features will run in offline mode.\n"
         "  1. Copy .env.example to .env\n"
         "  2. Set your GROQ_API_KEY in .env\n"
         "  Obtain a free key at: https://console.groq.com/\n",
         file=sys.stderr,
     )
-    sys.exit(1)
+    client = None
+else:
+    client = Groq(api_key=GROQ_API_KEY)
 # ---------------- IMPORT UTILS ----------------
 from utils.sip import calculate_sip
 from utils.tax import calculate_tax
@@ -33,13 +29,12 @@ from utils.money_score import calculate_money_score
 from utils.multi_agent import run_multi_agent
 from utils.stock import get_stock_price
 from utils.expense_track import calculate_expense, insights
-from utils import persistence
-from utils.ai_categorizer import AICategorizer
+from utils.validation import ValidationError, validate_string, validate_float, validate_int
 
 app = Flask(__name__)
 
 # ---------------- INIT DATABASE ----------------
-from models import db, Expense, Asset, Liability, Portfolio, PriceAlert
+from models import db, Expense, Asset, Liability, BudgetLimit, BudgetAlert, PriceAlert
 
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///money_mentor.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -49,20 +44,41 @@ with app.app_context():
     db.create_all()
 
 # ---------------- INIT GROQ ----------------
-client = Groq(api_key=GROQ_API_KEY)
-
-# Initialize AI Categorizer
-ai_categorizer = AICategorizer()
+# client is initialized in the startup validation block above
 
 # ── Dev-mode startup message ─────────────────────────────────
 if os.getenv("FLASK_ENV", "development") != "production":
-    print("[OK] Groq client initialised successfully.")
-    print("[OK] AI Expense Categorizer loaded.")
-
-# ---------------- HOME ----------------
+    if client:
+        print("[OK] Groq client initialised successfully.")
+    else:
+        print("[WARNING] Groq client is running in offline mode.")
 @app.route("/")
 def home():
-    return render_template("index.html")
+    return render_template("dashboard.html", active_page="dashboard")
+
+@app.route("/stock", methods=["GET"])
+def stock():
+    return render_template("stock.html", active_page="stock")
+
+@app.route("/pdf-parser", methods=["GET"])
+def pdf_parser():
+    return render_template("pdf.html", active_page="pdf")
+
+@app.route("/agent-page", methods=["GET"])
+def agent_page():
+    return render_template("agent.html", active_page="agent")
+
+@app.route("/expense", methods=["GET"])
+def expense():
+    return render_template("expense.html", active_page="expense")
+
+@app.route("/networth", methods=["GET"])
+def networth():
+    return render_template("networth.html", active_page="networth")
+
+@app.route("/budget", methods=["GET"])
+def budget():
+    return render_template("budget.html", active_page="budget")
 
 
 # ---------------- HEALTH CHECK ----------------
@@ -72,7 +88,37 @@ def health_check():
     return jsonify({"status": "ok", "service": "AI Money Mentor"}), 200
 
 
+# ---------------- AI STATUS (Issue #218) ----------------
+@app.route("/api/status", methods=["GET"])
+def ai_status():
+    """
+    Reports whether the Groq AI client is available.
+    The frontend can call this on page load to show/hide AI-dependent UI
+    and display an informative offline banner instead of a confusing error.
+    """
+    if client is not None:
+        return jsonify({
+            "ai_online": True,
+            "message": "AI Money Mentor is online and ready."
+        })
+    return jsonify({
+        "ai_online": False,
+        "message": (
+            "AI features are unavailable — GROQ_API_KEY is not configured. "
+            "Set GROQ_API_KEY in your .env file to enable AI features."
+        )
+    })
+
+
 # ---------------- ERROR HANDLERS ----------------
+@app.errorhandler(ValidationError)
+def handle_validation_error(error):
+    return jsonify({
+        "error": "Bad Request",
+        "message": str(error),
+        "status_code": 400
+    }), 400
+
 @app.errorhandler(400)
 def bad_request(error):
     return jsonify({
@@ -84,6 +130,9 @@ def bad_request(error):
 
 @app.errorhandler(404)
 def not_found(error):
+    # Return HTML page for browser navigation, JSON for API clients
+    if request.accept_mimetypes.accept_html and not request.accept_mimetypes.accept_json:
+        return render_template("404.html", active_page=None), 404
     return jsonify({
         "error": "Not Found",
         "message": "The requested endpoint does not exist.",
@@ -109,77 +158,91 @@ def internal_server_error(error):
     }), 500
 
 
-# ---------------- 🤖 MULTI-AGENT AI CHAT ----------------
-from utils.multi_agent_system import MultiAgentRouter
-
-# Initialize multi-agent router
-multi_agent_router = None
-
-def get_router():
-    global multi_agent_router
-    if multi_agent_router is None:
-        multi_agent_router = MultiAgentRouter(client)
-    return multi_agent_router
-
-@app.route("/chat", methods=["POST"])
+# ---------------- 🤖 AI CHAT ----------------
+@app.route("/chat", methods=["GET", "POST"])
 def chat():
-    """Multi-agent powered chat with specialized financial advisors"""
+    if request.method == "GET":
+        return render_template("chat.html", active_page="chat")
     try:
-        data = request.json
-        msg = data.get("message", "")
+        if client is None:
+            return jsonify({
+                "reply": "AI Money Mentor is offline because GROQ_API_KEY is not configured. Please set GROQ_API_KEY in your env/config files."
+            })
+
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        msg = validate_string(data.get("message"), "message")
         history = data.get("history", [])
-        
-        if not msg:
-            return jsonify({"reply": "Please ask a question about your finances."}), 400
-        
-        # Use multi-agent system
-        router = get_router()
-        result = router.process_query(msg, history)
-        
-        # Format response with agent info (optional, can be hidden)
-        reply = result['response']
-        
-        # Uncomment below to show which agent responded (for debugging)
-        # reply = f"**[{result['agent']} - {result['specialization']}]**\n\n{result['response']}"
-        
+        if not isinstance(history, list):
+            raise ValidationError("'history' must be a list")
+
+        # Build messages: system prompt + last 10 history turns + current message
+        system_prompt = (
+            "You are an expert AI financial advisor for Indian users.\n\n"
+            "Your job:\n"
+            "- Help users manage money smartly\n"
+            "- Teach budgeting, saving, and investing\n"
+            "- Give simple, practical, real-life advice\n\n"
+            "Response rules:\n"
+            "- Always use structured format:\n"
+            "Income / Situation Summary:\n"
+            "- ...\n"
+            "Budget Breakdown (if applicable):\n"
+            "- Needs: 50%\n"
+            "- Wants: 30%\n"
+            "- Savings: 20%\n"
+            "Advice:\n"
+            "- Give clear steps\n"
+            "- Keep it simple and actionable\n\n"
+            "Tone:\n"
+            "- Friendly, practical, and easy to understand"
+        )
+        messages = [{"role": "system", "content": system_prompt}]
+        messages += history[-10:]
+        messages.append({"role": "user", "content": msg})
+
+        res = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages
+        )
         return jsonify({
-            "reply": reply,
-            "agent_used": result.get('agent', 'AI Advisor'),
-            "specialization": result.get('specialization', 'Finance'),
-            "confidence": result.get('confidence', 0.8)
+            "reply": res.choices[0].message.content
         })
-        
+
+    except ValidationError as e:
+        raise e
     except Exception as e:
-        app.logger.error(f"Multi-Agent Chat Error: {str(e)}")
+        app.logger.error(f"Groq API Error: {str(e)}")
         return jsonify({
-            "reply": "I'm here to help with your financial questions. Could you please rephrase your question?"
-        }), 200
-
-@app.route("/agent-stats", methods=["GET"])
-def agent_stats():
-    """Get performance statistics for all agents (admin endpoint)"""
-    try:
-        router = get_router()
-        stats = router.get_performance_stats()
-        return jsonify({"success": True, "stats": stats})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
+            "reply": "Unable to generate a response at the moment. Please try again later."
+        }), 500
 
 
 # ---------------- 💸 SIP ----------------
-@app.route("/sip", methods=["POST"])
+@app.route("/sip", methods=["GET", "POST"])
 def sip():
+    if request.method == "GET":
+        return render_template("sip.html", active_page="sip")
     try:
-        data = request.json
-        result = calculate_sip(
-            float(data["monthly"]),
-            float(data["rate"]),
-            int(data["years"])
-        )
-        return jsonify({"future_value": result})
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        monthly = validate_float(data.get("monthly"), "monthly", min_val=0.0)
+        rate = validate_float(data.get("rate"), "rate", min_val=0.0)
+        years = validate_int(data.get("years"), "years", min_val=1)
+        inflation = validate_float(data.get("inflation", 0.0), "inflation", min_val=0.0)
 
+        result = calculate_sip(monthly, rate, years, inflation)
+        return jsonify({
+            "future_value": result["nominal_value"],
+            "nominal_value": result["nominal_value"],
+            "inflation_adjusted_value": result["inflation_adjusted_value"],
+            "inflation_applied": result["inflation_applied"]
+        })
+
+    except ValidationError as e:
+        raise e
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -188,68 +251,119 @@ def sip():
 @app.route("/portfolio", methods=["POST"])
 def portfolio():
     try:
-        stock = request.json["stock"].upper()
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        stock = validate_string(data.get("stock"), "stock").upper()
         result = get_stock_price(stock)
+        if "error" in result:
+            raise ValidationError(result["error"])
+        return jsonify(result)
+
+    except ValidationError as e:
+        raise e
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/alerts", methods=["GET"])
+def get_alerts():
+    try:
+        alerts = PriceAlert.query.all()
+        return jsonify([a.to_dict() for a in alerts])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/alerts", methods=["POST"])
+def create_alert():
+    try:
+        data = request.json
+        if not data or "symbol" not in data or "target_price" not in data:
+            return jsonify({"error": "Missing required fields"}), 400
         
-        # AI Sentiment Analysis
-        sentiment = "Neutral"
-        analysis = "No recent news available to analyze."
+        symbol = data["symbol"].strip().upper()
+        target_price = float(data["target_price"])
+        condition = data.get("condition", "above").strip().lower()
         
-        if "error" not in result and result.get("news"):
-            headlines = [n["title"] for n in result["news"]]
-            news_text = "\n".join([f"- {h}" for h in headlines])
+        if condition not in ("above", "below"):
+            return jsonify({"error": "Invalid condition value"}), 400
             
+        alert = PriceAlert(symbol=symbol, target_price=target_price, condition=condition)
+        db.session.add(alert)
+        db.session.commit()
+        return jsonify(alert.to_dict()), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/alerts/<int:alert_id>", methods=["DELETE"])
+def delete_alert(alert_id):
+    try:
+        alert = PriceAlert.query.get(alert_id)
+        if not alert:
+            return jsonify({"error": "Alert not found"}), 404
+        db.session.delete(alert)
+        db.session.commit()
+        return jsonify({"status": "success", "message": "Alert deleted successfully"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    
+# ---------------- 💸 TAX ----------------
+@app.route("/tax", methods=["GET", "POST"])
+def tax():
+    if request.method == "GET":
+        return render_template("tax.html", active_page="tax")
+    try:
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        income = validate_float(data.get("income"), "income", min_val=0.0)
+        deduction_80c = validate_float(data.get("deduction_80c", 0.0), "deduction_80c", min_val=0.0)
+        deduction_80d = validate_float(data.get("deduction_80d", 0.0), "deduction_80d", min_val=0.0)
+        deduction_hra = validate_float(data.get("deduction_hra", 0.0), "deduction_hra", min_val=0.0)
+        
+        tax_details = calculate_tax(
+            income,
+            deduction_80c=deduction_80c,
+            deduction_80d=deduction_80d,
+            deduction_hra=deduction_hra
+        )
+        
+        # AI Tax-saving advice
+        recommendations = "You are already in the zero-tax bracket! No additional tax-saving investments are required."
+        
+        recommended_regime = tax_details.get("recommended", "New Regime")
+        regime_key = "new_regime" if recommended_regime == "New Regime" else "old_regime"
+        total_tax = tax_details.get(regime_key, {}).get("total_tax", 0.0)
+        
+        # Only query AI if there is actual tax payable and client is available
+        if total_tax > 0.0 and client:
             prompt = (
-                f"Analyze the market sentiment for stock ticker {stock} based on the following recent news headlines:\n"
-                f"{news_text}\n\n"
-                f"Your output must be in this exact format:\n"
-                f"SENTIMENT: [Bullish / Bearish / Neutral]\n"
-                f"EXPLANATION: [A concise 2-3 sentence summary explaining why the stock is moving based on the news, or overall outlook if news is mixed.]"
+                f"A user in India has a gross annual income of ₹{income:,} and has a total tax liability of "
+                f"₹{total_tax:,} under the recommended {recommended_regime}.\n\n"
+                f"Generate a customized list of tax-saving investment recommendations for them. "
+                f"Suggest specific options under Section 80C (up to 1.5L, e.g. ELSS, PPF), Section 80CCD(1B) (up to 50k in NPS), "
+                f"and Section 80D (Health Insurance). Be brief and format the response as a bulleted list with clear estimated tax savings."
             )
             
             try:
                 ai_res = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=[
-                        {"role": "system", "content": "You are a professional stock market advisor. Be concise and accurate."},
+                        {"role": "system", "content": "You are a professional Indian tax consultant. Give brief, actionable advice."},
                         {"role": "user", "content": prompt}
                     ]
                 )
-                ai_output = ai_res.choices[0].message.content.strip()
-                
-                # Simple parsing of the formatted output
-                if "SENTIMENT:" in ai_output:
-                    parts = ai_output.split("EXPLANATION:")
-                    sent_part = parts[0].replace("SENTIMENT:", "").strip()
-                    # Clean sentiment word
-                    for option in ["Bullish", "Bearish", "Neutral"]:
-                        if option.lower() in sent_part.lower():
-                            sentiment = option
-                            break
-                    if len(parts) > 1:
-                        analysis = parts[1].strip()
-                    else:
-                        analysis = ai_output
-                else:
-                    analysis = ai_output
+                recommendations = ai_res.choices[0].message.content.strip()
             except Exception as ai_err:
-                app.logger.error(f"Stock AI Analysis Error: {str(ai_err)}")
-                analysis = "AI Sentiment Analysis is currently unavailable."
-        
-        result["sentiment"] = sentiment
-        result["analysis"] = analysis
-        return jsonify(result)
+                app.logger.error(f"Tax AI Recommendation Error: {str(ai_err)}")
+                recommendations = "AI Tax recommendations are currently unavailable. Consider investing in ELSS or NPS to reduce your tax."
+        elif total_tax > 0.0:
+            recommendations = "AI Tax recommendations are currently offline (no GROQ_API_KEY configured). Consider investing in ELSS or NPS to reduce your tax."
+                
+        tax_details["ai_recommendations"] = recommendations
+        return jsonify({"tax": tax_details})
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    
-# ---------------- 💸 TAX ----------------
-@app.route("/tax", methods=["POST"])
-def tax():
-    try:
-        income = float(request.json["income"])
-        return jsonify({"tax": calculate_tax(income)})
-
+    except ValidationError as e:
+        raise e
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -263,35 +377,52 @@ def upload():
         return jsonify({"data": result})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": str(e)})
 
 
 # ---------------- 🧠 MULTI AGENT ----------------
 @app.route("/agent", methods=["POST"])
 def run_agent_route():
+    if not client:
+        return jsonify({
+            "error": "AI Agent is offline: GROQ_API_KEY is not configured on the server."
+        })
     try:
-        query = request.json["query"]
+        if client is None:
+            return jsonify({
+                "error": "AI Multi-Agent is offline because GROQ_API_KEY is not configured. Please set GROQ_API_KEY in your env/config files."
+            })
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        query = validate_string(data.get("query"), "query")
         response = run_multi_agent(client, query)
         return jsonify({"response": response})
 
+    except ValidationError as e:
+        raise e
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
 
 # ---------------- 💰 MONEY SCORE ----------------
-@app.route("/money-score", methods=["POST"])
+@app.route("/money-score", methods=["GET", "POST"])
 def money_score():
+    if request.method == "GET":
+        return render_template("score.html", active_page="score")
     try:
-        data = request.json
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        
+        income = validate_float(data.get("income"), "income", min_val=0.0)
+        expenses = validate_float(data.get("expenses"), "expenses", min_val=0.0)
+        savings = validate_float(data.get("savings"), "savings", min_val=0.0)
+        investments = validate_float(data.get("investments"), "investments", min_val=0.0)
+        debt = validate_float(data.get("debt"), "debt", min_val=0.0)
+        emergency = validate_float(data.get("emergency"), "emergency", min_val=0.0)
 
-        score = calculate_money_score(
-            float(data["income"]),
-            float(data["expenses"]),
-            float(data["savings"]),
-            float(data["investments"]),
-            float(data["debt"]),
-            float(data["emergency"])
-        )
+        score = calculate_money_score(income, expenses, savings, investments, debt, emergency)
 
         if score >= 80:
             status = "Excellent 💚"
@@ -307,225 +438,41 @@ def money_score():
             "status": status
         })
 
+    except ValidationError as e:
+        raise e
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
 
-# ---------------- 🤖 AI EXPENSE CATEGORIZATION ----------------
-
-@app.route("/categorize", methods=["POST"])
-def categorize_expense():
-    """AI endpoint to categorize an expense without saving"""
-    try:
-        data = request.json
-        description = data.get("description", "")
-        
-        if not description:
-            return jsonify({"error": "Description is required"}), 400
-        
-        result = ai_categorizer.categorize(description)
-        
-        return jsonify({
-            "success": True,
-            "description": description,
-            "predicted_category": result['category'],
-            "confidence": result['confidence'],
-            "matched_keywords": result.get('matched_categories', [])
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/add_expense_ai", methods=["POST"])
-def add_expense_ai():
-    """Add expense with AI auto-categorization"""
-    try:
-        data = request.json
-        description = data.get("description", "")
-        amount = float(data.get("amount", 0))
-        date = data.get("date", "")
-        
-        if not description or not amount:
-            return jsonify({"error": "Description and amount are required"}), 400
-        
-        # Let AI categorize
-        ai_result = ai_categorizer.categorize(description)
-        
-        expense = Expense(
-            category=ai_result['category'],
-            amount=amount,
-            date=date,
-            ai_confidence=ai_result['confidence'],
-            user_corrected=False,
-            original_ai_category=ai_result['category']
-        )
-        
-        db.session.add(expense)
-        db.session.commit()
-        
-        return jsonify({
-            "status": "success",
-            "expense_id": expense.id,
-            "ai_category": ai_result['category'],
-            "confidence": ai_result['confidence'],
-            "message": f"Expense automatically categorized as {ai_result['category']} with {ai_result['confidence']*100}% confidence"
-        })
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/correct_category", methods=["POST"])
-def correct_category():
-    """User corrects AI category - helps AI learn"""
-    try:
-        data = request.json
-        expense_id = data.get("expense_id")
-        correct_category = data.get("correct_category")
-        description = data.get("description", "")
-        
-        expense = Expense.query.get(expense_id)
-        if not expense:
-            return jsonify({"error": "Expense not found"}), 404
-        
-        # Store original before correction
-        original_category = expense.category
-        
-        # Update expense
-        expense.category = correct_category
-        expense.user_corrected = True
-        expense.original_ai_category = original_category
-        
-        # Teach AI
-        ai_categorizer.learn_from_correction(description, correct_category)
-        
-        db.session.commit()
-        
-        return jsonify({
-            "status": "success",
-            "message": f"Category corrected from {original_category} to {correct_category}",
-            "ai_improved": True
-        })
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/anomaly_detection", methods=["GET"])
-def detect_anomalies():
-    """Detect unusual spending patterns"""
-    try:
-        expenses = Expense.query.all()
-        if len(expenses) < 5:
-            return jsonify({"message": "Need at least 5 expenses for anomaly detection", "anomalies": []})
-        
-        # Calculate average spending per category
-        category_totals = {}
-        category_counts = {}
-        
-        for expense in expenses:
-            cat = expense.category
-            amount = expense.amount
-            
-            if cat not in category_totals:
-                category_totals[cat] = 0
-                category_counts[cat] = 0
-            
-            category_totals[cat] += amount
-            category_counts[cat] += 1
-        
-        # Calculate averages
-        category_avg = {}
-        for cat in category_totals:
-            category_avg[cat] = category_totals[cat] / category_counts[cat]
-        
-        # Find anomalies (spending > 2x average)
-        anomalies = []
-        for expense in expenses:
-            avg = category_avg.get(expense.category, expense.amount)
-            if expense.amount > avg * 2 and expense.amount > 1000:  # 2x average and >1000
-                anomalies.append({
-                    "id": expense.id,
-                    "description": "AI detected",
-                    "category": expense.category,
-                    "amount": expense.amount,
-                    "date": expense.date,
-                    "reason": f"Spent ₹{expense.amount} which is {round(expense.amount/avg, 1)}x higher than your average of ₹{round(avg, 2)}"
-                })
-        
-        return jsonify({"anomalies": anomalies, "total_anomalies": len(anomalies)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/spending_insights", methods=["GET"])
-def spending_insights():
-    """Get AI-powered spending insights"""
-    try:
-        expenses = Expense.query.all()
-        
-        if not expenses:
-            return jsonify({"message": "No expenses found", "insights": []})
-        
-        # Category breakdown
-        category_spending = {}
-        for expense in expenses:
-            cat = expense.category
-            if cat not in category_spending:
-                category_spending[cat] = 0
-            category_spending[cat] += expense.amount
-        
-        # Find top spending category
-        top_category = max(category_spending, key=category_spending.get)
-        
-        # Calculate monthly average
-        from datetime import datetime, timedelta
-        now = datetime.now()
-        thirty_days_ago = now - timedelta(days=30)
-        
-        recent_total = 0
-        for expense in expenses:
-            expense_date = datetime.strptime(expense.date, "%Y-%m-%d")
-            if expense_date > thirty_days_ago:
-                recent_total += expense.amount
-        
-        insights_list = [
-            f"Your top spending category is {top_category} (₹{category_spending[top_category]:,.2f})",
-            f"You've spent ₹{recent_total:,.2f} in the last 30 days",
-            f"AI confidence in categorizations: {round(sum(e.ai_confidence for e in expenses)/len(expenses)*100)}%",
-        ]
-        
-        # Subscription detection
-        subscriptions = [e for e in expenses if e.is_subscription or "subscription" in e.category.lower()]
-        if subscriptions:
-            insights_list.append(f"Found {len(subscriptions)} potential subscriptions - review them to save money")
-        
-        return jsonify({"insights": insights_list})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-# ---------------- EXPENSE TRACKER (Original) ----------------
+# Expense Tracker Features
 
 @app.route("/add_expense", methods=["POST"])
 def add_expense():
     try:
-        data = request.json
-        if not data or "category" not in data or "amount" not in data or "date" not in data:
-            return jsonify({"error": "category, amount, and date are required"}), 400
-
-        print("RECEIVED:", data)
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        category = validate_string(data.get("category"), "category")
+        amount = validate_float(data.get("amount"), "amount", min_val=0.01)
+        date = validate_string(data.get("date"), "date")
 
         expense = Expense(
-            category=str(data["category"]).strip(),
-            amount=float(data["amount"]),
-            date=str(data["date"]).strip()
+            category=category,
+            amount=amount,
+            date=date
         )
         db.session.add(expense)
         db.session.commit()
+        
+        # Check thresholds
+        ym = expense.date[:7] if len(expense.date) >= 7 else None
+        run_threshold_checks(expense.category, ym)
+        
         return jsonify({"status": "success"})
+
+    except ValidationError as e:
+        raise e
     except Exception as e:
-        print("ERROR:", str(e))
         return jsonify({"error": str(e)}), 400
 
 @app.route("/calculate", methods=["GET"])
@@ -535,15 +482,22 @@ def calculate():
     result["expenses"] = expense_data
     return jsonify(result)
 
-
 @app.route("/insights", methods=["GET"])
 def expense_insights():
     expense_data = [e.to_dict() for e in Expense.query.order_by(Expense.id).all()]
+    if not client:
+        # Calculate standard expenses metrics but return fallback AI insights content
+        totals = calculate_expense(expense_data)
+        return jsonify({
+            "insights": "<div class=\"insight-card\"><h3>AI Insights Offline</h3><p>Personalized AI savings suggestions are currently offline because the GROQ_API_KEY is not configured on the server. Please configure it to enable insights.</p></div>",
+            "summary": totals
+        })
     result = insights(client, expense_data)
     return jsonify(result)
 
-
 # ---------------- NET WORTH TRACKER ----------------
+# Net Worth Tracker Features
+
 @app.route("/net-worth", methods=["GET", "POST"])
 def get_net_worth():
     assets = Asset.query.order_by(Asset.id).all()
@@ -557,328 +511,247 @@ def get_net_worth():
         "liabilities": liabilities_data,
         "total_assets": total_assets,
         "total_liabilities": total_liabilities,
-        "net_worth": total_assets - total_liabilities,
+        "net_worth": total_assets - total_liabilities
     })
-
 
 @app.route("/add-asset", methods=["POST"])
 def add_asset():
     try:
-        data = request.json
-        if not data or "name" not in data or "amount" not in data:
-            return jsonify({"error": "name and amount are required"}), 400
-        asset = Asset(name=str(data["name"]).strip(), amount=float(data["amount"]))
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        name = validate_string(data.get("name"), "name")
+        amount = validate_float(data.get("amount"), "amount", min_val=0.0)
+        
+        asset = Asset(name=name, amount=amount)
         db.session.add(asset)
         db.session.commit()
         return jsonify({"status": "success"})
+    except ValidationError as e:
+        raise e
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-
 
 @app.route("/add-liability", methods=["POST"])
 def add_liability():
     try:
-        data = request.json
-        if not data or "name" not in data or "amount" not in data:
-            return jsonify({"error": "name and amount are required"}), 400
-        liability = Liability(name=str(data["name"]).strip(), amount=float(data["amount"]))
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        name = validate_string(data.get("name"), "name")
+        amount = validate_float(data.get("amount"), "amount", min_val=0.0)
+        
+        liability = Liability(name=name, amount=amount)
         db.session.add(liability)
         db.session.commit()
         return jsonify({"status": "success"})
+    except ValidationError as e:
+        raise e
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-
 
 @app.route("/delete-item", methods=["POST"])
 def delete_item():
-    """Delete an asset or liability by its stable id (NOT list index).
-
-    Previously this used list.pop(index) which silently corrupted
-    all subsequent indices after the first deletion.
-    """
     try:
-        data = request.json
-        item_type = data.get("type") # 'asset' or 'liability'
-        item_id = int(data.get("id")) # positional index from the frontend
+        data = request.json or {}
+        if not isinstance(data, dict):
+            raise ValidationError("Request body must be a JSON object")
+        item_type = validate_string(data.get("type"), "type")
+        if item_type not in ('asset', 'liability'):
+            raise ValidationError("'type' must be either 'asset' or 'liability'")
+        item_db_id = validate_int(data.get("id"), "id", min_val=1)
 
-        if item_type == 'asset':
-            rows = Asset.query.order_by(Asset.id).all()
-            db.session.delete(rows[item_id])
+        if item_type == "asset":
+            item = Asset.query.get(item_db_id)
         else:
-            rows = Liability.query.order_by(Liability.id).all()
-            db.session.delete(rows[item_id])
+            item = Liability.query.get(item_db_id)
 
-        db.session.commit()
-        return jsonify({"status": "success"})
-    except KeyError as e:
-        return jsonify({"error": str(e)}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-# ---------------- PORTFOLIO TRACKER ----------------
-
-# Simple cache for stock prices (5 minutes)
-price_cache = {}
-CACHE_DURATION = 300  # 5 seconds for testing, change to 300 for production
-
-def get_cached_price(symbol):
-    """Get cached stock price or fetch new one"""
-    cache_key = symbol.upper()
-    now = datetime.now().timestamp()
-    
-    if cache_key in price_cache:
-        cached_time, cached_price = price_cache[cache_key]
-        if now - cached_time < CACHE_DURATION:
-            return cached_price
-    return None
-
-def set_cached_price(symbol, price):
-    """Cache stock price"""
-    cache_key = symbol.upper()
-    price_cache[cache_key] = (datetime.now().timestamp(), price)
-
-@app.route("/portfolio/add", methods=["POST"])
-def add_portfolio_item():
-    """Add a stock to portfolio"""
-    try:
-        data = request.json
-        symbol = data.get("symbol", "").upper()
-        name = data.get("name", symbol)
-        quantity = float(data.get("quantity", 0))
-        buy_price = float(data.get("buy_price", 0))
-        buy_date = data.get("buy_date", datetime.now().strftime("%Y-%m-%d"))
-        investment_type = data.get("investment_type", "stock")
-        
-        if not symbol or quantity <= 0 or buy_price <= 0:
-            return jsonify({"error": "Invalid input"}), 400
-        
-        # Validate stock symbol
-        try:
-            import yfinance as yf
-            stock = yf.Ticker(symbol)
-            info = stock.info
-            if not info or 'regularMarketPrice' not in info:
-                # Try to get basic info
-                hist = stock.history(period="1d")
-                if hist.empty:
-                    return jsonify({"error": f"Invalid symbol: {symbol}"}), 400
-            name = info.get('longName', name)
-        except:
-            pass
-        
-        portfolio_item = Portfolio(
-            symbol=symbol,
-            name=name,
-            quantity=quantity,
-            buy_price=buy_price,
-            buy_date=buy_date,
-            investment_type=investment_type
-        )
-        db.session.add(portfolio_item)
-        db.session.commit()
-        
-        return jsonify({"success": True, "message": f"Added {symbol} to portfolio"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route("/portfolio/list", methods=["GET"])
-def get_portfolio():
-    """Get all portfolio items with live prices"""
-    try:
-        items = Portfolio.query.all()
-        portfolio_data = []
-        total_invested = 0
-        total_current = 0
-        
-        for item in items:
-            # Get live price (with cache)
-            cached_price = get_cached_price(item.symbol)
-            if cached_price:
-                current_price = cached_price
-            else:
-                try:
-                    import yfinance as yf
-                    stock = yf.Ticker(item.symbol)
-                    hist = stock.history(period="1d")
-                    if not hist.empty:
-                        current_price = hist['Close'].iloc[-1]
-                        set_cached_price(item.symbol, current_price)
-                    else:
-                        current_price = item.buy_price
-                except:
-                    current_price = item.buy_price
-            
-            item_data = item.to_dict(current_price)
-            portfolio_data.append(item_data)
-            total_invested += item_data["invested_value"]
-            total_current += item_data["current_value"]
-        
-        total_pnl = total_current - total_invested
-        total_pnl_percent = (total_pnl / total_invested * 100) if total_invested > 0 else 0
-        
-        return jsonify({
-            "success": True,
-            "holdings": portfolio_data,
-            "summary": {
-                "total_invested": round(total_invested, 2),
-                "total_current": round(total_current, 2),
-                "total_pnl": round(total_pnl, 2),
-                "total_pnl_percent": round(total_pnl_percent, 2),
-                "total_holdings": len(portfolio_data)
-            }
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route("/portfolio/delete/<int:item_id>", methods=["DELETE"])
-def delete_portfolio_item(item_id):
-    """Remove item from portfolio"""
-    try:
-        item = Portfolio.query.get(item_id)
         if not item:
-            return jsonify({"error": "Item not found"}), 404
-        
+            return jsonify({"error": f"Item not found (type={item_type}, id={item_db_id})"}), 404
+
         db.session.delete(item)
         db.session.commit()
-        return jsonify({"success": True, "message": "Item removed"})
+        return jsonify({"status": "success"})
+    except ValidationError as e:
+        raise e
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-@app.route("/portfolio/alert/add", methods=["POST"])
-def add_price_alert():
-    """Add price alert for a stock"""
-    try:
-        data = request.json
-        symbol = data.get("symbol", "").upper()
-        target_price = float(data.get("target_price", 0))
-        condition = data.get("condition", "above")
+# Helper to check budget thresholds
+def run_threshold_checks(category, year_month=None):
+    if not year_month:
+        import datetime
+        year_month = datetime.datetime.now().strftime("%Y-%m")
         
-        alert = PriceAlert(
-            symbol=symbol,
-            target_price=target_price,
-            condition=condition
-        )
-        db.session.add(alert)
+    limit = BudgetLimit.query.filter_by(category=category).first()
+    if not limit or limit.limit_amount <= 0:
+        return []
+        
+    expenses = Expense.query.filter(
+        Expense.category == category,
+        Expense.date.like(f"{year_month}%")
+    ).all()
+    
+    total_spent = sum(e.amount for e in expenses)
+    pct = total_spent / limit.limit_amount
+    
+    triggered = []
+    for threshold in [100, 90, 80]:
+        target = threshold / 100.0
+        if pct >= target:
+            exists = BudgetAlert.query.filter_by(
+                category=category,
+                year_month=year_month,
+                threshold=threshold
+            ).first()
+            if not exists:
+                alert = BudgetAlert(
+                    category=category,
+                    year_month=year_month,
+                    threshold=threshold
+                )
+                db.session.add(alert)
+                triggered.append(threshold)
+                print(
+                    f"\n[EMAIL ALERT] To: user@example.com\n"
+                    f"Subject: Budget Alert: {category} spending reached {threshold}%\n"
+                    f"Body: You have spent ₹{total_spent:.2f} of your ₹{limit.limit_amount:.2f} limit in category '{category}'.\n",
+                    file=sys.stderr
+                )
+    if triggered:
         db.session.commit()
-        
-        return jsonify({"success": True, "message": f"Alert set for {symbol} at ₹{target_price}"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    return triggered
 
-@app.route("/portfolio/alerts", methods=["GET"])
-def get_alerts():
-    """Get all price alerts"""
-    try:
-        alerts = PriceAlert.query.all()
-        return jsonify({"success": True, "alerts": [a.to_dict() for a in alerts]})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
 
-@app.route("/portfolio/check-alerts", methods=["GET"])
-def check_price_alerts():
-    """Check and trigger price alerts"""
-    try:
-        alerts = PriceAlert.query.filter_by(is_triggered=False).all()
-        triggered = []
-        
-        for alert in alerts:
-            cached_price = get_cached_price(alert.symbol)
-            if cached_price:
-                current_price = cached_price
-            else:
-                try:
-                    import yfinance as yf
-                    stock = yf.Ticker(alert.symbol)
-                    hist = stock.history(period="1d")
-                    if not hist.empty:
-                        current_price = hist['Close'].iloc[-1]
-                    else:
-                        continue
-                except:
-                    continue
+# ---------------- SMART BUDGET ALERTS ----------------
+
+@app.route("/budget/limits", methods=["GET", "POST"])
+def budget_limits():
+    if request.method == "POST":
+        try:
+            data = request.json or {}
+            if not isinstance(data, dict):
+                raise ValidationError("Request body must be a JSON object")
+            category = validate_string(data.get("category"), "category")
+            limit_amount = validate_float(data.get("limit_amount"), "limit_amount", min_val=0.0)
             
-            if alert.condition == "above" and current_price >= alert.target_price:
-                alert.is_triggered = True
-                triggered.append({"symbol": alert.symbol, "target": alert.target_price, "current": current_price})
-            elif alert.condition == "below" and current_price <= alert.target_price:
-                alert.is_triggered = True
-                triggered.append({"symbol": alert.symbol, "target": alert.target_price, "current": current_price})
+            limit = BudgetLimit.query.filter_by(category=category).first()
+            if limit:
+                limit.limit_amount = limit_amount
+            else:
+                limit = BudgetLimit(category=category, limit_amount=limit_amount)
+                db.session.add(limit)
+            db.session.commit()
+            return jsonify({"status": "success"})
+        except ValidationError as e:
+            raise e
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+    else:
+        limits = BudgetLimit.query.order_by(BudgetLimit.category).all()
+        return jsonify([l.to_dict() for l in limits])
+
+@app.route("/budget/status", methods=["GET"])
+def budget_status():
+    import datetime
+    year_month = request.args.get("month", datetime.datetime.now().strftime("%Y-%m"))
+    
+    limits = BudgetLimit.query.all()
+    limits_dict = {l.category: l.limit_amount for l in limits}
+    
+    expenses = Expense.query.filter(Expense.date.like(f"{year_month}%")).all()
+    
+    spent_by_category = {}
+    for e in expenses:
+        spent_by_category[e.category] = spent_by_category.get(e.category, 0.0) + e.amount
         
-        db.session.commit()
-        return jsonify({"success": True, "triggered": triggered})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-
-
-# ---------------- 📅 MONTHLY BUDGET PLANNER ----------------
-@app.route("/budget-planner", methods=["GET"])
-def budget_planner():
-    return render_template("index.html")
-
-
-@app.route("/budget-planner/analyze", methods=["POST"])
-def analyze_budget():
-    try:
-        data = request.json
-        income = float(data.get("income", 0))
-        categories = data.get("categories", [])
-
-        if not income or not categories:
-            return jsonify({"error": "Income and categories are required"}), 400
-
-        total_budgeted = sum(float(c.get("budgeted", 0)) for c in categories)
-        total_spent = sum(float(c.get("spent", 0)) for c in categories)
-
-        budget_lines = "\n".join([
-            f"- {c['name']}: Budgeted ₹{c['budgeted']}, Spent ₹{c['spent']} "
-            f"({round(float(c['spent']) / float(c['budgeted']) * 100 if float(c.get('budgeted', 0)) > 0 else 0)}% used)"
-            for c in categories
-        ])
-
-        prompt = (
-            f"You are a personal finance advisor. Analyze this monthly budget:\n\n"
-            f"Monthly Income: ₹{income}\n"
-            f"Total Budgeted: ₹{total_budgeted}\n"
-            f"Total Spent: ₹{total_spent}\n"
-            f"Unallocated / Remaining: ₹{income - total_spent}\n\n"
-            f"Category Breakdown:\n{budget_lines}\n\n"
-            f"Give exactly 4 bullet points of concise, actionable advice:\n"
-            f"• Overall budget health assessment\n"
-            f"• Any category that is over budget or at risk\n"
-            f"• One specific saving tip based on the numbers\n"
-            f"• Recommended savings target for next month"
-        )
-
-        ai_res = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "You are a helpful personal finance advisor. Be concise and specific with numbers."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        advice = ai_res.choices[0].message.content.strip()
-
-        return jsonify({
-            "success": True,
-            "advice": advice,
-            "summary": {
-                "income": income,
-                "total_budgeted": round(total_budgeted, 2),
-                "total_spent": round(total_spent, 2),
-                "remaining": round(income - total_spent, 2),
-                "savings_rate": round((income - total_spent) / income * 100, 1) if income > 0 else 0
-            }
+    status_list = []
+    all_categories = set(limits_dict.keys()) | set(spent_by_category.keys())
+    
+    for cat in sorted(all_categories):
+        lim = limits_dict.get(cat, 0.0)
+        spent = spent_by_category.get(cat, 0.0)
+        pct = (spent / lim * 100) if lim > 0 else 0.0
+        status_list.append({
+            "category": cat,
+            "limit_amount": lim,
+            "spent": spent,
+            "percentage": round(pct, 2)
         })
+        
+    return jsonify({
+        "month": year_month,
+        "categories": status_list,
+        "total_budgeted": sum(limits_dict.values()),
+        "total_spent": sum(spent_by_category.values())
+    })
 
+@app.route("/budget/alerts", methods=["GET"])
+def budget_alerts():
+    alerts = BudgetAlert.query.order_by(BudgetAlert.triggered_at.desc()).limit(10).all()
+    return jsonify([a.to_dict() for a in alerts])
+
+
+# Delete a budget limit by ID (Issue #179)
+@app.route("/budget/limits/<int:limit_id>", methods=["DELETE"])
+def delete_budget_limit(limit_id):
+    """Remove a category budget limit and its associated alerts."""
+    try:
+        limit = db.session.get(BudgetLimit, limit_id)
+        if not limit:
+            return jsonify({"error": f"Budget limit with id {limit_id} not found."}), 404
+        # Remove any alerts tied to this category before deleting the limit
+        BudgetAlert.query.filter_by(category=limit.category).delete(synchronize_session="fetch")
+        db.session.delete(limit)
+        db.session.commit()
+        return jsonify({"status": "success", "deleted_category": limit.category})
     except Exception as e:
-        app.logger.error(f"Budget Planner Error: {str(e)}")
         return jsonify({"error": str(e)}), 400
 
+
+# ---------------- SCHEDULER ----------------
+from apscheduler.schedulers.background import BackgroundScheduler
+
+def check_all_budgets_job():
+    with app.app_context():
+        import datetime
+        ym = datetime.datetime.now().strftime("%Y-%m")
+        limits = BudgetLimit.query.all()
+        for limit in limits:
+            run_threshold_checks(limit.category, ym)
+
+def check_stock_alerts_job():
+    with app.app_context():
+        alerts = PriceAlert.query.filter_by(is_triggered=False).all()
+        for alert in alerts:
+            res = get_stock_price(alert.symbol)
+            if res and "price" in res and "error" not in res:
+                current_price = res["price"]
+                triggered = False
+                if alert.condition == "above" and current_price >= alert.target_price:
+                    triggered = True
+                elif alert.condition == "below" and current_price <= alert.target_price:
+                    triggered = True
+                
+                if triggered:
+                    alert.is_triggered = True
+                    print(
+                        f"\n[STOCK ALERT] Triggered for {alert.symbol}\n"
+                        f"Condition: {alert.condition} {alert.target_price}\n"
+                        f"Current Price: {current_price}\n",
+                        file=sys.stderr
+                    )
+        db.session.commit()
+
+if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(check_all_budgets_job, 'interval', days=1)
+    scheduler.add_job(check_stock_alerts_job, 'interval', minutes=10)
+    scheduler.start()
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
     debug_mode = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "yes")
     app.run(debug=debug_mode)
+
+

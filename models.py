@@ -100,8 +100,12 @@ class Asset(db.Model):
     name = db.Column(db.String(120), nullable=False)
     amount = db.Column(db.Float, nullable=False)
 
-    def to_dict(self, index):
-        return {"id": index, "name": self.name, "amount": self.amount}
+    def to_dict(self):
+        # Returns the real database primary key so /delete-item can look up the
+        # row by stable PK rather than by positional list index. Using a
+        # positional index was the root cause of the negative-index silent
+        # deletion and out-of-range IndexError bugs (issue #125).
+        return {"id": self.id, "name": self.name, "amount": self.amount}
 
 
 class Liability(db.Model):
@@ -110,5 +114,38 @@ class Liability(db.Model):
     name = db.Column(db.String(120), nullable=False)
     amount = db.Column(db.Float, nullable=False)
 
-    def to_dict(self, index):
-        return {"id": index, "name": self.name, "amount": self.amount}
+    def to_dict(self):
+        # Same fix as Asset.to_dict -- returns the real PK, not a list index.
+        return {"id": self.id, "name": self.name, "amount": self.amount}
+
+
+class BudgetLimit(db.Model):
+    __tablename__ = "budget_limits"
+    id = db.Column(db.Integer, primary_key=True)
+    category = db.Column(db.String(120), unique=True, nullable=False)
+    limit_amount = db.Column(db.Float, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "category": self.category,
+            "limit_amount": self.limit_amount
+        }
+
+
+class BudgetAlert(db.Model):
+    __tablename__ = "budget_alerts"
+    id = db.Column(db.Integer, primary_key=True)
+    category = db.Column(db.String(120), nullable=False)
+    year_month = db.Column(db.String(7), nullable=False)  # e.g., "2026-06"
+    threshold = db.Column(db.Integer, nullable=False)    # 80, 90, or 100
+    triggered_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "category": self.category,
+            "year_month": self.year_month,
+            "threshold": self.threshold,
+            "triggered_at": self.triggered_at.isoformat()
+        }
